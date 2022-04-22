@@ -1,61 +1,67 @@
+//! WAL receiver manages an open connection to safekeeper, to get the WAL it streams into.
+//! To do so, a current implementation needs to do the following:
 //!
-//! WAL receiver connects to the WAL safekeeper service, streams WAL,
-//! decodes records and saves them in the repository for the correct
-//! timeline.
+//! * acknowledge the timelines that it needs to stream wal into.
+//! Pageserver is able to dynamically (un)load tenants on attach and detach,
+//! hence WAL receiver needs to react on such events.
 //!
-//! We keep one WAL receiver active per timeline.
+//! * determine the way that a timeline needs WAL streaming.
+//! For that, it watches specific keys in etcd broker and pulls the relevant data periodically.
+//! The data is produced by safekeepers, that push it periodically and pull it to synchronize between each other.
+//! Without this data, no WAL streaming is possible currently.
+//!
+//! Only one active WAL streaming connection is allowed at a time.
+//! The connection is supposed to be updated periodically, based on safekeeper timeline data.
+//!
+//! * handle the actual connection and WAL streaming
+//!
+//!
+//! ## Implementation details
+//!
+//! WAL receiver's implementation consists of 3 kinds of nested loops, separately handling the logic from the bullets above:
+//!
+//! * wal receiver main thread, containing the control async loop: timeline addition/removal and interruption of a whole thread handling.
+//! The loop can exit with an error, if broker or safekeeper connection attempt limit is reached, with the backpressure mechanism.
+//! All of the code inside the loop is either async or a spawn_blocking wrapper around the sync code.
+//!
+//! * wal receiver broker task, handling the etcd broker interactions, safekeeper selection logic and backpressure.
+//! On every concequent broker/wal streamer connection attempt, the loop steps are forced to wait for some time before running,
+//! increasing with the number of attempts (capped with 30s).
+//!
+//! Apart from the broker management, it keeps the wal streaming connection open, with the safekeeper having the most advanced timeline state.
+//! The connection could be closed from safekeeper side (with error or not), could be cancelled from pageserver side from time to time.
+//!
+//! * wal streaming task, opening the libpq conneciton and reading the data out of it to the end, then reporting the result to the broker thread
+
+mod connection_handler;
 
 use crate::config::PageServerConf;
-use crate::repository::{Repository, Timeline};
-use crate::tenant_mgr;
-use crate::thread_mgr;
+use crate::repository::Timeline;
+use crate::tenant_mgr::{self, LocalTimelineUpdate, TenantState};
 use crate::thread_mgr::ThreadKind;
-use crate::walingest::WalIngest;
-use anyhow::{bail, Context, Error, Result};
-use bytes::BytesMut;
-use fail::fail_point;
-use lazy_static::lazy_static;
-use postgres_ffi::waldecoder::*;
-use postgres_protocol::message::backend::ReplicationMessage;
-use postgres_types::PgLsn;
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use crate::{thread_mgr, DatadirTimelineImpl};
+use anyhow::{ensure, Context};
+use chrono::{NaiveDateTime, Utc};
+use etcd_broker::{Client, SkTimelineInfo, SkTimelineSubscriptionKind};
+use itertools::Itertools;
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::num::{NonZeroU32, NonZeroU64};
+use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::thread_local;
-use std::time::SystemTime;
-use tokio::pin;
-use tokio_postgres::replication::ReplicationStream;
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
-use tokio_stream::StreamExt;
-use tracing::*;
-use utils::{
-    lsn::Lsn,
-    pq_proto::ZenithFeedback,
-    zid::{ZTenantId, ZTenantTimelineId, ZTimelineId},
+use std::time::Duration;
+use tokio::select;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
 };
+use tracing::*;
+use url::Url;
+use utils::pq_proto::ZenithFeedback;
+use utils::zid::{ZNodeId, ZTenantId, ZTenantTimelineId, ZTimelineId};
 
-///
-/// A WAL receiver's data stored inside the global `WAL_RECEIVERS`.
-/// We keep one WAL receiver active per timeline.
-///
-#[serde_as]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WalReceiverEntry {
-    thread_id: u64,
-    wal_producer_connstr: String,
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    last_received_msg_lsn: Option<Lsn>,
-    /// the timestamp (in microseconds) of the last received message
-    last_received_msg_ts: Option<u128>,
-}
-
-lazy_static! {
-    static ref WAL_RECEIVERS: Mutex<HashMap<(ZTenantId, ZTimelineId), WalReceiverEntry>> =
-        Mutex::new(HashMap::new());
-}
+use self::connection_handler::{WalConnectionEvent, WalreceiverConnection};
 
 thread_local! {
     // Boolean that is true only for WAL receiver threads
@@ -64,375 +70,520 @@ thread_local! {
     pub(crate) static IS_WAL_RECEIVER: Cell<bool> = Cell::new(false);
 }
 
-fn drop_wal_receiver(tenantid: ZTenantId, timelineid: ZTimelineId) {
-    let mut receivers = WAL_RECEIVERS.lock().unwrap();
-    receivers.remove(&(tenantid, timelineid));
+pub fn init_wal_receiver_main_thread(
+    conf: &'static PageServerConf,
+    mut timeline_updates_receiver: mpsc::UnboundedReceiver<LocalTimelineUpdate>,
+) -> anyhow::Result<()> {
+    let etcd_endpoints = conf.broker_endpoints.clone();
+    ensure!(
+        !etcd_endpoints.is_empty(),
+        "Cannot start wal receiver: etcd endpoints are empty"
+    );
+    let broker_prefix = &conf.broker_etcd_prefix;
+    info!(
+        "Starting wal receiver main thread, etdc endpoints: {}",
+        etcd_endpoints.iter().map(Url::to_string).join(", ")
+    );
+
+    thread_mgr::spawn(
+        ThreadKind::WalReceiverManager,
+        None,
+        None,
+        "WAL receiver manager main thread",
+        true,
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create storage sync runtime")?;
+            let mut etcd_client = runtime
+                .block_on(etcd_broker::Client::connect(etcd_endpoints, None))
+                .context("Failed to connect to etcd")?;
+            let mut local_timeline_wal_receivers = HashMap::new();
+
+            loop {
+                let loop_step = runtime.block_on(async {
+                    select! {
+                        // check for shutdown first
+                        biased;
+                        _ = thread_mgr::shutdown_watcher() => {
+                            shutdown_all_wal_connections(&mut local_timeline_wal_receivers).await;
+                            ControlFlow::Break(Ok(()))
+                        },
+                        step = walreceiver_main_thread_loop_step(
+                            broker_prefix,
+                            &mut etcd_client,
+                            &mut timeline_updates_receiver,
+                            &mut local_timeline_wal_receivers,
+                        ).instrument(info_span!("walreceiver_main_thread_loop_step")) => step,
+                    }
+                });
+
+                match loop_step {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(Ok(())) => {
+                        info!("Wal receiver main thread stopped successfully");
+                        return Ok(());
+                    }
+                    ControlFlow::Break(Err(e)) => {
+                        error!("WAL receiver main thread exited with an error: {e:?}");
+                        return Err(e);
+                    }
+                }
+            }
+        },
+    )
+    .map(|_thread_id| ())
+    .context("Failed to spawn wal receiver main thread")
 }
 
-// Launch a new WAL receiver, or tell one that's running about change in connection string
-pub fn launch_wal_receiver(
-    conf: &'static PageServerConf,
-    tenantid: ZTenantId,
-    timelineid: ZTimelineId,
-    wal_producer_connstr: &str,
-) -> Result<()> {
-    let mut receivers = WAL_RECEIVERS.lock().unwrap();
+async fn walreceiver_main_thread_loop_step<'a>(
+    broker_prefix: &str,
+    etcd_client: &mut Client,
+    timeline_updates_receiver: &'a mut mpsc::UnboundedReceiver<LocalTimelineUpdate>,
+    local_timeline_wal_receivers: &'a mut HashMap<
+        ZTenantId,
+        HashMap<ZTimelineId, TimelineWalReceiverHandles>,
+    >,
+    // TODO kb odd type, can it be just Result<()>?
+) -> ControlFlow<anyhow::Result<()>, ()> {
+    match timeline_updates_receiver.recv().await {
+        Some(update) => {
+            info!("Processing timeline update: {update:?}");
+            match update {
+                LocalTimelineUpdate::Remove(id) => {
+                    match local_timeline_wal_receivers.get_mut(&id.tenant_id) {
+                        Some(timelines) => {
+                            if let Some(handles) = timelines.remove(&id.timeline_id) {
+                                let wal_receiver_shutdown_result = handles.shutdown(id).await;
+                                if wal_receiver_shutdown_result.is_err() {
+                                    return ControlFlow::Break(wal_receiver_shutdown_result)
+                                }
+                            };
+                            if timelines.is_empty() {
+                                let state_change_result = change_tenant_state(id.tenant_id, TenantState::Idle).await;
+                                if state_change_result.is_err() {
+                                    return ControlFlow::Break(state_change_result)
+                                }
+                            }
+                        }
+                        None => warn!("Timeline {id} does not have a tenant entry in wal receiver main thread"),
+                    };
+                }
+                LocalTimelineUpdate::Add(new_id, new_timeline) => {
+                    let timelines = local_timeline_wal_receivers
+                        .entry(new_id.tenant_id)
+                        .or_default();
 
-    match receivers.get_mut(&(tenantid, timelineid)) {
-        Some(receiver) => {
-            debug!("wal receiver already running, updating connection string");
-            receiver.wal_producer_connstr = wal_producer_connstr.into();
+                    if timelines.is_empty() {
+                        let state_change_result =
+                            change_tenant_state(new_id.tenant_id, TenantState::Active).await;
+                        if state_change_result.is_err() {
+                            return ControlFlow::Break(state_change_result);
+                        }
+                    } else if let Some(old_entry_handles) = timelines.remove(&new_id.timeline_id) {
+                        warn!(
+                            "Readding to an existing timeline {new_id}, shutting the old wal receiver down"
+                        );
+                        let wal_receiver_shutdown_result = old_entry_handles.shutdown(new_id).await;
+                        if wal_receiver_shutdown_result.is_err() {
+                            return ControlFlow::Break(wal_receiver_shutdown_result);
+                        }
+                    }
+
+                    let (wal_connect_timeout, _max_retries) =
+                        match fetch_tenant_settings(new_id.tenant_id).await {
+                            Ok(settings) => settings,
+                            Err(e) => return ControlFlow::Break(Err(e)),
+                        };
+
+                    for attempt in 0.. {
+                        exponential_backoff(attempt, 2.0, 60.0).await;
+                        let wal_connection_manager = WalConnectionManager {
+                            timeline_id: new_id,
+                            timeline: Arc::clone(&new_timeline),
+                            wal_connect_timeout,
+                            // TODO kb more tenant settings for walreceiver selection
+                            no_wal_timeout: Duration::from_secs(30),
+                            max_lsn_lag: NonZeroU64::new(300).unwrap(),
+                            connection_data: None,
+                            wal_connection_attempt: 0,
+                        };
+                        match start_timeline_wal_broker(
+                            broker_prefix,
+                            etcd_client,
+                            wal_connection_manager,
+                        )
+                        .await
+                        {
+                            Ok(new_handles) => {
+                                timelines.insert(new_id.timeline_id, new_handles);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("Attempt #{attempt}, failed to start timeline {new_id} wal broker: {e:#}")
+                            }
+                        }
+                    }
+                }
+            }
         }
         None => {
-            let thread_id = thread_mgr::spawn(
-                ThreadKind::WalReceiver,
-                Some(tenantid),
-                Some(timelineid),
-                "WAL receiver thread",
-                false,
-                move || {
-                    IS_WAL_RECEIVER.with(|c| c.set(true));
-                    thread_main(conf, tenantid, timelineid);
-                    Ok(())
+            info!("Local timeline update channel closed, shutting down all wal connections");
+            shutdown_all_wal_connections(local_timeline_wal_receivers).await;
+            return ControlFlow::Break(Ok(()));
+        }
+    }
+
+    ControlFlow::Continue(())
+}
+
+async fn fetch_tenant_settings(tenant_id: ZTenantId) -> anyhow::Result<(Duration, NonZeroU32)> {
+    tokio::task::spawn_blocking(move || {
+        let repo = tenant_mgr::get_repository_for_tenant(tenant_id)
+            .with_context(|| format!("no repository found for tenant {tenant_id}"))?;
+        Ok::<_, anyhow::Error>((
+            repo.get_walreceiver_connect_timeout(),
+            repo.get_max_walreceiver_connect_attempts(),
+        ))
+    })
+    .await
+    .with_context(|| format!("Failed to join on tenant {tenant_id} settings fetch task"))?
+}
+
+async fn change_tenant_state(tenant_id: ZTenantId, new_state: TenantState) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        tenant_mgr::set_tenant_state(tenant_id, new_state)
+            .with_context(|| format!("Failed to activate tenant {tenant_id}"))
+    })
+    .await
+    .with_context(|| format!("Failed to spawn activation task for tenant {tenant_id}"))?
+}
+
+async fn exponential_backoff(n: u32, base: f64, max_seconds: f64) {
+    if n == 0 {
+        return;
+    }
+    let seconds_to_wait = base.powf(f64::from(n) - 1.0).min(max_seconds);
+    info!("Backpressure: waiting {seconds_to_wait} seconds before proceeding with the task");
+    tokio::time::sleep(Duration::from_secs_f64(seconds_to_wait)).await;
+}
+
+async fn shutdown_all_wal_connections(
+    local_timeline_wal_receivers: &mut HashMap<
+        ZTenantId,
+        HashMap<ZTimelineId, TimelineWalReceiverHandles>,
+    >,
+) {
+    let mut broker_join_handles = Vec::new();
+    for (tenant_id, timelines) in local_timeline_wal_receivers.drain() {
+        for (timeline_id, handles) in timelines {
+            handles.cancellation_sender.send(()).ok();
+            broker_join_handles.push((
+                ZTenantTimelineId::new(tenant_id, timeline_id),
+                handles.broker_join_handle,
+            ));
+        }
+    }
+
+    let mut tenants = HashSet::with_capacity(broker_join_handles.len());
+    for (id, broker_join_handle) in broker_join_handles {
+        tenants.insert(id.tenant_id);
+        debug!("Waiting for wal broker for timeline {id} to finish");
+        if let Err(e) = broker_join_handle.await {
+            error!("Failed to join on wal broker for timeline {id}: {e}");
+        }
+    }
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        for tenant_id in tenants {
+            if let Err(e) = tenant_mgr::set_tenant_state(tenant_id, TenantState::Idle) {
+                error!("Failed to make tenant {tenant_id} idle: {e:?}");
+            }
+        }
+    })
+    .await
+    {
+        error!("Failed to spawn a task to make all tenants idle: {e:?}");
+    }
+}
+
+struct TimelineWalReceiverHandles {
+    broker_join_handle: JoinHandle<anyhow::Result<()>>,
+    cancellation_sender: watch::Sender<()>,
+}
+
+impl TimelineWalReceiverHandles {
+    async fn shutdown(self, id: ZTenantTimelineId) -> anyhow::Result<()> {
+        self.cancellation_sender.send(()).context(
+            "Unexpected: cancellation sender is dropped before the receiver in the loop is",
+        )?;
+        debug!("Waiting for wal receiver for timeline {id} to finish");
+        self.broker_join_handle
+            .await
+            .with_context(|| format!("Failed to join the wal reveiver broker for timeline {id}"))?
+            .with_context(|| format!("Wal reveiver broker for timeline {id} failed to finish"))
+    }
+}
+
+async fn start_timeline_wal_broker(
+    broker_prefix: &str,
+    etcd_client: &mut Client,
+    mut wal_connection_manager: WalConnectionManager,
+) -> anyhow::Result<TimelineWalReceiverHandles> {
+    let id = wal_connection_manager.timeline_id;
+    let (cancellation_sender, mut cancellation_receiver) = watch::channel(());
+
+    let mut subscription = etcd_broker::subscribe_to_safekeeper_timeline_updates(
+        etcd_client,
+        SkTimelineSubscriptionKind::timeline(broker_prefix.to_owned(), id),
+    )
+    .await
+    .with_context(|| format!("Failed to subscribe for timeline {id} updates in etcd"))?;
+
+    let broker_join_handle = tokio::spawn(async move {
+        info!("WAL receiver broker started");
+
+        loop {
+            select! {
+                biased;
+                _ = cancellation_receiver.changed() => {
+                    break;
+                }
+
+                walreceiver_poll_result = wal_connection_manager.poll_connection_event() => match walreceiver_poll_result {
+                    ControlFlow::Break(()) => break,
+                    ControlFlow::Continue(()) => {},
                 },
-            )?;
 
-            let receiver = WalReceiverEntry {
-                thread_id,
-                wal_producer_connstr: wal_producer_connstr.into(),
-                last_received_msg_lsn: None,
-                last_received_msg_ts: None,
-            };
-            receivers.insert((tenantid, timelineid), receiver);
-
-            // Update tenant state and start tenant threads, if they are not running yet.
-            tenant_mgr::activate_tenant(tenantid)?;
+                updates = subscription.fetch_data() => match updates {
+                    Some(mut all_timeline_updates) => {
+                        if let Some(subscribed_timeline_updates) = all_timeline_updates.remove(&id) {
+                            match wal_connection_manager.select_connection_candidate(subscribed_timeline_updates) {
+                                Some((new_safekeeper_id, new_wal_producer_connstr)) => {
+                                    info!(
+                                        "Switching to different safekeeper {new_safekeeper_id} for timeline {id}",
+                                    );
+                                    wal_connection_manager.change_connection(new_safekeeper_id, new_wal_producer_connstr).await;
+                                },
+                                None => {}
+                            }
+                        }
+                    },
+                    None => {
+                        info!("Subscription source end was dropped, no more updates are possible, shutting down");
+                        break;
+                    },
+                },
+            }
         }
-    };
-    Ok(())
+
+        info!("Loop ended, shutting down");
+        wal_connection_manager.close_connection().await;
+        subscription
+            .cancel()
+            .await
+            .with_context(|| format!("Failed to cancel timeline {id} subscription in etcd"))?;
+        Ok(())
+    }.instrument(info_span!("timeline_walreceiver", id = %id)));
+
+    Ok(TimelineWalReceiverHandles {
+        broker_join_handle,
+        cancellation_sender,
+    })
 }
 
-/// Look up a WAL receiver's data in the global `WAL_RECEIVERS`
-pub fn get_wal_receiver_entry(
-    tenant_id: ZTenantId,
-    timeline_id: ZTimelineId,
-) -> Option<WalReceiverEntry> {
-    let receivers = WAL_RECEIVERS.lock().unwrap();
-    receivers.get(&(tenant_id, timeline_id)).cloned()
+struct WalConnectionManager {
+    timeline_id: ZTenantTimelineId,
+    timeline: Arc<DatadirTimelineImpl>,
+    wal_connect_timeout: Duration,
+    no_wal_timeout: Duration,
+    max_lsn_lag: NonZeroU64,
+    wal_connection_attempt: u32,
+    connection_data: Option<ConnectionData>,
 }
 
-//
-// This is the entry point for the WAL receiver thread.
-//
-fn thread_main(conf: &'static PageServerConf, tenant_id: ZTenantId, timeline_id: ZTimelineId) {
-    let _enter = info_span!("WAL receiver", timeline = %timeline_id, tenant = %tenant_id).entered();
-    info!("WAL receiver thread started");
+struct ConnectionData {
+    wal_producer_connstr: String,
+    safekeeper_id: ZNodeId,
+    connection: WalreceiverConnection,
+    connection_init_time: NaiveDateTime,
+    last_walreceiver_data: Option<(ZenithFeedback, NaiveDateTime)>,
+}
 
-    // Look up the current WAL producer address
-    let wal_producer_connstr = {
-        match get_wal_receiver_entry(tenant_id, timeline_id) {
-            Some(e) => e.wal_producer_connstr,
+impl WalConnectionManager {
+    async fn poll_connection_event(&mut self) -> ControlFlow<(), ()> {
+        let (connection_data, walreceiver_event) = match self.connection_data.as_mut() {
+            Some(connection_data) => match connection_data.connection.next_event().await {
+                Some(event) => (connection_data, event),
+                None => {
+                    warn!("WAL receiver event source stopped sending messages, aborting the loop");
+                    return ControlFlow::Break(());
+                }
+            },
             None => {
-                info!(
-                    "Unable to create the WAL receiver thread: no WAL receiver entry found for tenant {} and timeline {}",
-                    tenant_id, timeline_id
-                );
-                return;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                warn!("WAL receiver without a connection spent sleeping 30s without being interrupted, aborting the loop");
+                return ControlFlow::Break(());
             }
-        }
-    };
-
-    // Make a connection to the WAL safekeeper, or directly to the primary PostgreSQL server,
-    // and start streaming WAL from it.
-    let res = walreceiver_main(conf, tenant_id, timeline_id, &wal_producer_connstr);
-
-    // TODO cleanup info messages
-    if let Err(e) = res {
-        info!("WAL streaming connection failed ({})", e);
-    } else {
-        info!(
-            "walreceiver disconnected tenant {}, timelineid {}",
-            tenant_id, timeline_id
-        );
-    }
-
-    // Drop it from list of active WAL_RECEIVERS
-    // so that next callmemaybe request launched a new thread
-    drop_wal_receiver(tenant_id, timeline_id);
-}
-
-fn walreceiver_main(
-    _conf: &PageServerConf,
-    tenant_id: ZTenantId,
-    timeline_id: ZTimelineId,
-    wal_producer_connstr: &str,
-) -> anyhow::Result<(), Error> {
-    // Connect to the database in replication mode.
-    info!("connecting to {:?}", wal_producer_connstr);
-    let connect_cfg = format!(
-        "{} application_name=pageserver replication=true",
-        wal_producer_connstr
-    );
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    let (mut replication_client, connection) =
-        runtime.block_on(tokio_postgres::connect(&connect_cfg, NoTls))?;
-    // This is from tokio-postgres docs, but it is a bit weird in our case because we extensively use block_on
-    runtime.spawn(async move {
-        if let Err(e) = connection.await {
-            error!("connection error: {}", e);
-        }
-    });
-
-    info!("connected!");
-
-    // Immediately increment the gauge, then create a job to decrement it on thread exit.
-    // One of the pros of `defer!` is that this will *most probably*
-    // get called, even in presence of panics.
-    let gauge = crate::LIVE_CONNECTIONS_COUNT.with_label_values(&["wal_receiver"]);
-    gauge.inc();
-    scopeguard::defer! {
-        gauge.dec();
-    }
-
-    let identify = runtime.block_on(identify_system(&mut replication_client))?;
-    info!("{:?}", identify);
-    let end_of_wal = Lsn::from(u64::from(identify.xlogpos));
-    let mut caught_up = false;
-
-    let repo = tenant_mgr::get_repository_for_tenant(tenant_id)
-        .with_context(|| format!("no repository found for tenant {}", tenant_id))?;
-    let timeline =
-        tenant_mgr::get_local_timeline_with_load(tenant_id, timeline_id).with_context(|| {
-            format!(
-                "local timeline {} not found for tenant {}",
-                timeline_id, tenant_id
-            )
-        })?;
-    let remote_index = repo.get_remote_index();
-
-    //
-    // Start streaming the WAL, from where we left off previously.
-    //
-    // If we had previously received WAL up to some point in the middle of a WAL record, we
-    // better start from the end of last full WAL record, not in the middle of one.
-    let mut last_rec_lsn = timeline.get_last_record_lsn();
-    let mut startpoint = last_rec_lsn;
-
-    if startpoint == Lsn(0) {
-        bail!("No previous WAL position");
-    }
-
-    // There might be some padding after the last full record, skip it.
-    startpoint += startpoint.calc_padding(8u32);
-
-    info!(
-        "last_record_lsn {} starting replication from {}, server is at {}...",
-        last_rec_lsn, startpoint, end_of_wal
-    );
-
-    let query = format!("START_REPLICATION PHYSICAL {}", startpoint);
-
-    let copy_stream = runtime.block_on(replication_client.copy_both_simple(&query))?;
-    let physical_stream = ReplicationStream::new(copy_stream);
-    pin!(physical_stream);
-
-    let mut waldecoder = WalStreamDecoder::new(startpoint);
-
-    let mut walingest = WalIngest::new(&*timeline, startpoint)?;
-
-    while let Some(replication_message) = runtime.block_on(async {
-        let shutdown_watcher = thread_mgr::shutdown_watcher();
-        tokio::select! {
-            // check for shutdown first
-            biased;
-            _ = shutdown_watcher => {
-                info!("walreceiver interrupted");
-                None
-            }
-            replication_message = physical_stream.next() => replication_message,
-        }
-    }) {
-        let replication_message = replication_message?;
-        let status_update = match replication_message {
-            ReplicationMessage::XLogData(xlog_data) => {
-                // Pass the WAL data to the decoder, and see if we can decode
-                // more records as a result.
-                let data = xlog_data.data();
-                let startlsn = Lsn::from(xlog_data.wal_start());
-                let endlsn = startlsn + data.len() as u64;
-
-                trace!("received XLogData between {} and {}", startlsn, endlsn);
-
-                waldecoder.feed_bytes(data);
-
-                while let Some((lsn, recdata)) = waldecoder.poll_decode()? {
-                    let _enter = info_span!("processing record", lsn = %lsn).entered();
-
-                    // It is important to deal with the aligned records as lsn in getPage@LSN is
-                    // aligned and can be several bytes bigger. Without this alignment we are
-                    // at risk of hitting a deadlock.
-                    anyhow::ensure!(lsn.is_aligned());
-
-                    walingest.ingest_record(&timeline, recdata, lsn)?;
-
-                    fail_point!("walreceiver-after-ingest");
-
-                    last_rec_lsn = lsn;
-                }
-
-                if !caught_up && endlsn >= end_of_wal {
-                    info!("caught up at LSN {}", endlsn);
-                    caught_up = true;
-                }
-
-                timeline.tline.check_checkpoint_distance()?;
-
-                Some(endlsn)
-            }
-
-            ReplicationMessage::PrimaryKeepAlive(keepalive) => {
-                let wal_end = keepalive.wal_end();
-                let timestamp = keepalive.timestamp();
-                let reply_requested = keepalive.reply() != 0;
-
-                trace!(
-                    "received PrimaryKeepAlive(wal_end: {}, timestamp: {:?} reply: {})",
-                    wal_end,
-                    timestamp,
-                    reply_requested,
-                );
-
-                if reply_requested {
-                    Some(last_rec_lsn)
-                } else {
-                    None
-                }
-            }
-
-            _ => None,
         };
 
-        if let Some(last_lsn) = status_update {
-            let timeline_remote_consistent_lsn = runtime.block_on(async {
-                remote_index
-                    .read()
-                    .await
-                    // here we either do not have this timeline in remote index
-                    // or there were no checkpoints for it yet
-                    .timeline_entry(&ZTenantTimelineId {
-                        tenant_id,
-                        timeline_id,
-                    })
-                    .map(|remote_timeline| remote_timeline.metadata.disk_consistent_lsn())
-                    .unwrap_or(Lsn(0)) // no checkpoint was uploaded
-            });
-
-            // The last LSN we processed. It is not guaranteed to survive pageserver crash.
-            let write_lsn = u64::from(last_lsn);
-            // `disk_consistent_lsn` is the LSN at which page server guarantees local persistence of all received data
-            let flush_lsn = u64::from(timeline.tline.get_disk_consistent_lsn());
-            // The last LSN that is synced to remote storage and is guaranteed to survive pageserver crash
-            // Used by safekeepers to remove WAL preceding `remote_consistent_lsn`.
-            let apply_lsn = u64::from(timeline_remote_consistent_lsn);
-            let ts = SystemTime::now();
-
-            // Update the current WAL receiver's data stored inside the global hash table `WAL_RECEIVERS`
-            {
-                let mut receivers = WAL_RECEIVERS.lock().unwrap();
-                let entry = match receivers.get_mut(&(tenant_id, timeline_id)) {
-                    Some(e) => e,
-                    None => {
-                        anyhow::bail!(
-                            "no WAL receiver entry found for tenant {} and timeline {}",
-                            tenant_id,
-                            timeline_id
-                        );
-                    }
-                };
-
-                entry.last_received_msg_lsn = Some(last_lsn);
-                entry.last_received_msg_ts = Some(
-                    ts.duration_since(SystemTime::UNIX_EPOCH)
-                        .expect("Received message time should be before UNIX EPOCH!")
-                        .as_micros(),
-                );
+        match walreceiver_event {
+            WalConnectionEvent::Started => {
+                self.wal_connection_attempt = 0;
             }
+            WalConnectionEvent::NewWal(new_wal_data) => {
+                self.wal_connection_attempt = 0;
+                connection_data.last_walreceiver_data =
+                    Some((new_wal_data, Utc::now().naive_utc()));
+            }
+            WalConnectionEvent::End(walreceiver_result) => {
+                match walreceiver_result {
+                    Ok(()) => {
+                        info!("WAL receiver task finished, reconnecting");
+                        self.wal_connection_attempt = 0;
+                    }
+                    Err(e) => {
+                        error!("WAL receiver task failed: {e:#}, reconnecting");
+                        self.wal_connection_attempt += 1;
+                    }
+                }
+                self.close_connection().await;
+            }
+        }
 
-            // Send zenith feedback message.
-            // Regular standby_status_update fields are put into this message.
-            let zenith_status_update = ZenithFeedback {
-                current_timeline_size: timeline.get_current_logical_size() as u64,
-                ps_writelsn: write_lsn,
-                ps_flushlsn: flush_lsn,
-                ps_applylsn: apply_lsn,
-                ps_replytime: ts,
-            };
+        ControlFlow::Continue(())
+    }
 
-            debug!("zenith_status_update {:?}", zenith_status_update);
-
-            let mut data = BytesMut::new();
-            zenith_status_update.serialize(&mut data)?;
-            runtime.block_on(
-                physical_stream
-                    .as_mut()
-                    .zenith_status_update(data.len() as u64, &data),
-            )?;
+    async fn close_connection(&mut self) {
+        if let Some(data) = self.connection_data.take() {
+            if let Err(e) = data.connection.shutdown().await {
+                error!("Failed to shutdown walreceiver connection: {e:#}");
+            }
         }
     }
 
-    Ok(())
-}
-
-/// Data returned from the postgres `IDENTIFY_SYSTEM` command
-///
-/// See the [postgres docs] for more details.
-///
-/// [postgres docs]: https://www.postgresql.org/docs/current/protocol-replication.html
-#[derive(Debug)]
-// As of nightly 2021-09-11, fields that are only read by the type's `Debug` impl still count as
-// unused. Relevant issue: https://github.com/rust-lang/rust/issues/88900
-#[allow(dead_code)]
-pub struct IdentifySystem {
-    systemid: u64,
-    timeline: u32,
-    xlogpos: PgLsn,
-    dbname: Option<String>,
-}
-
-/// There was a problem parsing the response to
-/// a postgres IDENTIFY_SYSTEM command.
-#[derive(Debug, thiserror::Error)]
-#[error("IDENTIFY_SYSTEM parse error")]
-pub struct IdentifyError;
-
-/// Run the postgres `IDENTIFY_SYSTEM` command
-pub async fn identify_system(client: &mut Client) -> Result<IdentifySystem, Error> {
-    let query_str = "IDENTIFY_SYSTEM";
-    let response = client.simple_query(query_str).await?;
-
-    // get(N) from row, then parse it as some destination type.
-    fn get_parse<T>(row: &SimpleQueryRow, idx: usize) -> Result<T, IdentifyError>
-    where
-        T: FromStr,
-    {
-        let val = row.get(idx).ok_or(IdentifyError)?;
-        val.parse::<T>().or(Err(IdentifyError))
+    async fn change_connection(
+        &mut self,
+        new_safekeeper_id: ZNodeId,
+        new_wal_producer_connstr: String,
+    ) {
+        self.close_connection().await;
+        self.connection_data = Some(ConnectionData {
+            wal_producer_connstr: new_wal_producer_connstr.clone(),
+            safekeeper_id: new_safekeeper_id,
+            connection: WalreceiverConnection::new(
+                self.timeline_id,
+                new_wal_producer_connstr,
+                self.wal_connect_timeout,
+            ),
+            connection_init_time: Utc::now().naive_utc(),
+            last_walreceiver_data: None,
+        });
     }
 
-    // extract the row contents into an IdentifySystem struct.
-    // written as a closure so I can use ? for Option here.
-    if let Some(SimpleQueryMessage::Row(first_row)) = response.get(0) {
-        Ok(IdentifySystem {
-            systemid: get_parse(first_row, 0)?,
-            timeline: get_parse(first_row, 1)?,
-            xlogpos: get_parse(first_row, 2)?,
-            dbname: get_parse(first_row, 3).ok(),
-        })
-    } else {
-        Err(IdentifyError.into())
+    // TODO kb unit test this
+    fn select_connection_candidate(
+        &self,
+        safekeeper_timelines: HashMap<ZNodeId, SkTimelineInfo>,
+    ) -> Option<(ZNodeId, String)> {
+        let (&new_sk_id, new_sk_timeline, new_wal_producer_connstr) = safekeeper_timelines
+            .iter()
+            .filter(|(_, info)| {
+                info.commit_lsn > Some(self.timeline.tline.get_disk_consistent_lsn())
+            })
+            .filter_map(|(sk_id, info)| {
+                match wal_stream_connection_string(
+                    self.timeline_id,
+                    info.safekeeper_connstr.as_deref()?,
+                    info.pageserver_connstr.as_deref()?,
+                ) {
+                    Ok(connstr) => Some((sk_id, info, connstr)),
+                    Err(e) => {
+                        error!("Failed to create wal receiver connection string from broker data of safekeeper node {sk_id}: {e:#}");
+                        None
+                    }
+                }
+            })
+            .max_by_key(|(_, info, _)| info.commit_lsn)?;
+
+        match self.connection_data.as_ref() {
+            None => Some((new_sk_id, new_wal_producer_connstr)),
+            Some(old_connection) => {
+                let same_safekeeper = old_connection.safekeeper_id == new_sk_id;
+
+                if same_safekeeper
+                    && old_connection.wal_producer_connstr != new_wal_producer_connstr
+                {
+                    debug!("WAL producer connection string changed, old: '{}', new: '{new_wal_producer_connstr}', reconnecting",
+                            old_connection.wal_producer_connstr);
+                    return Some((new_sk_id, new_wal_producer_connstr));
+                } else if !same_safekeeper
+                    && self.candidate_advanced_over_threshold(old_connection, new_sk_timeline)
+                {
+                    return Some((new_sk_id, new_wal_producer_connstr));
+                }
+                None
+            }
+        }
     }
+
+    fn candidate_advanced_over_threshold(
+        &self,
+        old_connection: &ConnectionData,
+        new_sk_timeline: &SkTimelineInfo,
+    ) -> bool {
+        let new_commit_lsn = match new_sk_timeline.commit_lsn {
+            Some(lsn) => lsn,
+            None => return false,
+        };
+
+        let last_sk_interaction_time = match old_connection.last_walreceiver_data.as_ref() {
+            Some((last_walreceiver_data, data_submission_time)) => {
+                match new_commit_lsn
+                    .0
+                    .checked_sub(last_walreceiver_data.ps_flushlsn)
+                {
+                    Some(sk_lsn_advantage) => {
+                        if sk_lsn_advantage >= self.max_lsn_lag.get() {
+                            return true;
+                        }
+                    }
+                    None => debug!("Best SK candidate has its commit Lsn behind the current timeline's disk consistent Lsn"),
+                }
+
+                *data_submission_time
+            }
+            None => old_connection.connection_init_time,
+        };
+
+        let now = Utc::now().naive_utc();
+        match (now - last_sk_interaction_time).to_std() {
+            Ok(last_sk_interaction_time) => last_sk_interaction_time > self.no_wal_timeout,
+            Err(_e) => {
+                warn!("Last interaction with safekeeper {} happened in the future, ignoring the candidate. Interaction time: {last_sk_interaction_time}, now: {now}",
+                    old_connection.safekeeper_id);
+                false
+            }
+        }
+    }
+}
+
+fn wal_stream_connection_string(
+    ZTenantTimelineId {
+        tenant_id,
+        timeline_id,
+    }: ZTenantTimelineId,
+    listen_pg_addr_str: &str,
+    pageserver_connstr: &str,
+) -> anyhow::Result<String> {
+    let sk_connstr = format!("postgresql://no_user@{listen_pg_addr_str}/no_db");
+    let me_conf = sk_connstr
+        .parse::<postgres::config::Config>()
+        .with_context(|| {
+            format!("Failed to parse pageserver connection string '{sk_connstr}' as a postgres one")
+        })?;
+    let (host, port) = utils::connstring::connection_host_port(&me_conf);
+    Ok(format!(
+        "host={host} port={port} options='-c ztimelineid={timeline_id} ztenantid={tenant_id} pageserver_connstr={pageserver_connstr}'",
+    ))
 }
