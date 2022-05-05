@@ -23,20 +23,20 @@ distribution depends on the workload: the updates could be totally random, or
 there could be a long stream of updates to a single relation when data is bulk
 loaded, for example, or something in between.
 
-Cloud Storage                   Page Server                           Safekeeper
-                        L1               L0             Memory            WAL
+    Cloud Storage                   Page Server                           Safekeeper
+                            L1               L0             Memory            WAL
 
-+----+               +----+----+
-|AAAA|               |AAAA|AAAA|      +---+-----+         |
-+----+               +----+----+      |   |     |         |AA
-|BBBB|               |BBBB|BBBB|      |BB | AA  |         |BB
-+----+----+          +----+----+      |C  | BB  |         |CC
-|CCCC|CCCC|  <----   |CCCC|CCCC| <--- |D  | CC  |  <---   |DDD     <----   ADEBAABED
-+----+----+          +----+----+      |   | DDD |         |E
-|DDDD|DDDD|          |DDDD|DDDD|      |E  |     |         |
-+----+----+          +----+----+      |   |     |
-|EEEE|               |EEEE|EEEE|      +---+-----+
-+----+               +----+----+
+    +----+               +----+----+
+    |AAAA|               |AAAA|AAAA|      +---+-----+         |
+    +----+               +----+----+      |   |     |         |AA
+    |BBBB|               |BBBB|BBBB|      |BB | AA  |         |BB
+    +----+----+          +----+----+      |C  | BB  |         |CC
+    |CCCC|CCCC|  <----   |CCCC|CCCC| <--- |D  | CC  |  <---   |DDD     <----   ADEBAABED
+    +----+----+          +----+----+      |   | DDD |         |E
+    |DDDD|DDDD|          |DDDD|DDDD|      |E  |     |         |
+    +----+----+          +----+----+      |   |     |
+    |EEEE|               |EEEE|EEEE|      +---+-----+
+    +----+               +----+----+
 
 In this illustration, WAL is received as a stream from the Safekeeper, from the
 right.  It is immediately captured by the page server and stored quickly in

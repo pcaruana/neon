@@ -185,7 +185,10 @@ fn main() -> anyhow::Result<()> {
     // If failpoints are used, terminate the whole pageserver process if they are hit.
     let scenario = FailScenario::setup();
     if fail::has_failpoints() {
-        std::panic::set_hook(Box::new(|_| {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |pinfo| {
+            prev_hook(pinfo);
+
             std::process::exit(1);
         }));
     }
