@@ -30,7 +30,7 @@ const BACKUP_ELECTION_PATH: &str = "WAL_BACKUP";
 
 const LEASE_ACQUISITION_RETRY_DELAY_MS: u64 = 1000;
 
-async fn detect_task(
+async fn backup_task(
     conf: SafeKeeperConf,
     timeline_id: ZTenantTimelineId,
     backup_start: Lsn,
@@ -52,13 +52,15 @@ async fn detect_task(
 
     let mut backup_lsn = backup_start;
 
-    let mut lease: Option<i64> = None;
+    // let mut lease: Option<i64> = None;
 
     loop {
         let mut keepalive = None::<JoinHandle<Result<()>>>;
         let mut cancel = false;
 
         let c = conf.clone();
+
+        let lease =
         if c.broker_endpoints.is_some() {
             let lease_id = match broker::get_lease(&c).await {
                 Ok(l) => l,
@@ -69,92 +71,88 @@ async fn detect_task(
                 }
             };
 
-            keepalive = Some(spawn::<_>(broker::lease_keep_alive(lease_id, c.clone())));
+            let ka = spawn::<_>(broker::lease_keep_alive(lease_id, c.clone()));
 
-            lease = Some(lease_id);
-        }
+            if let Err(e) = broker::become_leader(
+                lease_id,
+                BACKUP_ELECTION_PATH.to_string(),
+                &timeline_id,
+                &conf,
+            )
+            .await
+            {
+                warn!("Error during candidate election, restarting. details: {:?}", e);
 
-        'leader: loop {
-            if let Some(lease_id) = lease {
-                if let Err(e) = broker::become_leader(
-                    lease_id,
-                    BACKUP_ELECTION_PATH.to_string(),
-                    &timeline_id,
-                    &conf,
-                )
-                .await
-                {
-                    warn!(
-                        "Error retreiving leader election details, restarting. details: {:?}",
-                        e
-                    );
-                    break;
-                }
+                ka.abort();
+                continue;
             }
 
-            loop {
-                if let Err(e) = lsn_durable.changed().await {
-                    warn!("Channel closed shutting down wal backup {:?}", e);
-                    cancel = true;
-                    break 'leader;
-                }
+            keepalive = Some(ka);
+            Some(lease_id)
+        } else { None };
 
-                let commit_lsn = *lsn_durable.borrow();
+        loop {
+            if let Err(e) = lsn_durable.changed().await {
+                warn!("Channel closed shutting down wal backup {:?}", e);
+                cancel = true;
+                break;
+            }
 
-                ensure!(
-                    commit_lsn >= backup_lsn,
-                    "backup lsn should never pass commit lsn"
-                );
+            let commit_lsn = *lsn_durable.borrow();
 
-                if backup_lsn.segment_number(wal_seg_size)
-                    == commit_lsn.segment_number(wal_seg_size)
+            ensure!(
+                commit_lsn >= backup_lsn,
+                "backup lsn should never pass commit lsn"
+            );
+
+            if backup_lsn.segment_number(wal_seg_size)
+                == commit_lsn.segment_number(wal_seg_size)
+            {
+                continue;
+            }
+
+            if lease.is_some() {
+                // Optimization idea for later:
+                //  Avoid checking election leader every time by returning current lease grant expiration time
+                //  Re-check leadership only after expiration time,
+                //  such approach woud reduce overhead on write-intensive workloads
+
+                match broker::is_leader(BACKUP_ELECTION_PATH.to_string(), &timeline_id, &conf)
+                    .await
                 {
-                    continue;
-                }
-
-                if lease.is_some() {
-                    // Optimization idea for later:
-                    //  Avoid checking election leader every time by returning current lease grant expiration time
-                    //  Re-check leadership only after expiration time,
-                    //  such approach woud reduce overhead on write-intensive workloads
-
-                    match broker::is_leader(BACKUP_ELECTION_PATH.to_string(), &timeline_id, &conf)
-                        .await
-                    {
-                        Ok(is_leader) => {
-                            if !is_leader {
-                                info!("Leader has changed for for the timeline {}", timeline_id);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Error validating leader for the timeline {}, {:?}",
-                                timeline_id, e
-                            );
+                    Ok(is_leader) => {
+                        if !is_leader {
+                            info!("Leader has changed for for the timeline {}", timeline_id);
                             break;
                         }
                     }
-                }
-
-                debug!(
-                    "Woken up for lsn {} committed, will back it up. backup lsn {}",
-                    commit_lsn, backup_lsn
-                );
-
-                match backup_lsn_range(backup_lsn, commit_lsn, wal_seg_size, &conf, timeline_id)
-                    .await
-                {
-                    Ok(backup_lsn_result) => {
-                        backup_lsn = backup_lsn_result;
-                        lsn_backed_up.send(backup_lsn)?;
-                    }
                     Err(e) => {
-                        error!(
-                            "Failure in backup backup commit_lsn {} backup lsn {}, {:?}",
-                            commit_lsn, backup_lsn, e
+                        warn!(
+                            "Error validating leader for the timeline {}, {:?}",
+                            timeline_id, e
                         );
+                        break;
                     }
+                }
+            }
+
+            debug!(
+                "Woken up for lsn {} committed, will back it up. backup lsn {}",
+                commit_lsn, backup_lsn
+            );
+
+            match backup_lsn_range(backup_lsn, commit_lsn, wal_seg_size, &conf, timeline_id)
+                .await
+            {
+                Ok(backup_lsn_result) => {
+                    backup_lsn = backup_lsn_result;
+                    lsn_backed_up.send(backup_lsn)?;
+                }
+                Err(e) => {
+                    error!(
+                        "Failure in backup backup commit_lsn {} backup lsn {}, {:?}",
+                        commit_lsn, backup_lsn, e
+                    );
                 }
             }
         }
@@ -261,7 +259,7 @@ pub fn create(
     });
 
     runtime.spawn(
-        detect_task(
+        backup_task(
             conf.clone(),
             *timeline_id,
             initial_lsn,
