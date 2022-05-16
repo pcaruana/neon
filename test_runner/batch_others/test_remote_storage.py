@@ -91,7 +91,7 @@ def test_remote_storage_backup_and_restore(zenith_env_builder: ZenithEnvBuilder,
 
     client.timeline_attach(UUID(tenant_id), UUID(timeline_id))
 
-    # is there a better way to assert that fafilpoint triggered?
+    # is there a better way to assert that failpoint triggered?
     time.sleep(10)
 
     # assert cannot attach timeline that is scheduled for download
