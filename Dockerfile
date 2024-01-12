@@ -32,7 +32,7 @@ RUN set -e \
 
 # Build final image
 #
-FROM debian:bullseye-20230612-slim
+FROM debian:bullseye-20231218-slim
 WORKDIR /data
 
 RUN set -e \
